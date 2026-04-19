@@ -28,10 +28,18 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (*taskdomain.Ta
 	}
 
 	model := &taskdomain.Task{
-		Title:       normalized.Title,
-		Description: normalized.Description,
-		Status:      normalized.Status,
+		Title:          normalized.Title,
+		Description:    normalized.Description,
+		Status:         normalized.Status,
+		RecurrenceType: normalized.RecurrenceType,
+		RecurrenceRule: normalized.RecurrenceRule,
 	}
+
+	// Валидируем правило повторения
+	if err := model.ValidateRule(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+
 	now := s.now()
 	model.CreatedAt = now
 	model.UpdatedAt = now
@@ -63,11 +71,18 @@ func (s *Service) Update(ctx context.Context, id int64, input UpdateInput) (*tas
 	}
 
 	model := &taskdomain.Task{
-		ID:          id,
-		Title:       normalized.Title,
-		Description: normalized.Description,
-		Status:      normalized.Status,
-		UpdatedAt:   s.now(),
+		ID:             id,
+		Title:          normalized.Title,
+		Description:    normalized.Description,
+		Status:         normalized.Status,
+		RecurrenceType: normalized.RecurrenceType,
+		RecurrenceRule: normalized.RecurrenceRule,
+		UpdatedAt:      s.now(),
+	}
+
+	// Валидируем правило повторения
+	if err := model.ValidateRule(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
 
 	updated, err := s.repo.Update(ctx, model)
@@ -90,6 +105,10 @@ func (s *Service) List(ctx context.Context) ([]taskdomain.Task, error) {
 	return s.repo.List(ctx)
 }
 
+func (s *Service) GetTasksForDate(ctx context.Context, date time.Time) ([]taskdomain.Task, error) {
+	return s.repo.GetTasksForDate(ctx, date)
+}
+
 func validateCreateInput(input CreateInput) (CreateInput, error) {
 	input.Title = strings.TrimSpace(input.Title)
 	input.Description = strings.TrimSpace(input.Description)
@@ -106,6 +125,10 @@ func validateCreateInput(input CreateInput) (CreateInput, error) {
 		return CreateInput{}, fmt.Errorf("%w: invalid status", ErrInvalidInput)
 	}
 
+	if input.RecurrenceType == "" {
+		input.RecurrenceType = taskdomain.RecurrenceNone
+	}
+
 	return input, nil
 }
 
@@ -119,6 +142,10 @@ func validateUpdateInput(input UpdateInput) (UpdateInput, error) {
 
 	if !input.Status.Valid() {
 		return UpdateInput{}, fmt.Errorf("%w: invalid status", ErrInvalidInput)
+	}
+
+	if input.RecurrenceType == "" {
+		input.RecurrenceType = taskdomain.RecurrenceNone
 	}
 
 	return input, nil

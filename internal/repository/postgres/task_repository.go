@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,13 +20,31 @@ func New(pool *pgxpool.Pool) *Repository {
 }
 
 func (r *Repository) Create(ctx context.Context, task *taskdomain.Task) (*taskdomain.Task, error) {
-	const query = `
-		INSERT INTO tasks (title, description, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, title, description, status, created_at, updated_at
-	`
+	var ruleJSON *string
+	if task.RecurrenceRule != nil {
+		jsonStr, err := task.RecurrenceRule.ToJSON()
+		if err != nil {
+			return nil, err
+		}
+		ruleJSON = &jsonStr
+	}
 
-	row := r.pool.QueryRow(ctx, query, task.Title, task.Description, task.Status, task.CreatedAt, task.UpdatedAt)
+	const query = `
+        INSERT INTO tasks (title, description, status, created_at, updated_at, recurrence_type, recurrence_rule)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, title, description, status, created_at, updated_at, recurrence_type, recurrence_rule
+    `
+
+	row := r.pool.QueryRow(ctx, query,
+		task.Title,
+		task.Description,
+		task.Status,
+		task.CreatedAt,
+		task.UpdatedAt,
+		task.RecurrenceType,
+		ruleJSON,
+	)
+
 	created, err := scanTask(row)
 	if err != nil {
 		return nil, err
@@ -36,42 +55,60 @@ func (r *Repository) Create(ctx context.Context, task *taskdomain.Task) (*taskdo
 
 func (r *Repository) GetByID(ctx context.Context, id int64) (*taskdomain.Task, error) {
 	const query = `
-		SELECT id, title, description, status, created_at, updated_at
-		FROM tasks
-		WHERE id = $1
-	`
+        SELECT id, title, description, status, created_at, updated_at, recurrence_type, recurrence_rule
+        FROM tasks
+        WHERE id = $1
+    `
 
 	row := r.pool.QueryRow(ctx, query, id)
-	found, err := scanTask(row)
+	task, err := scanTask(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, taskdomain.ErrNotFound
 		}
-
 		return nil, err
 	}
 
-	return found, nil
+	return task, nil
 }
 
 func (r *Repository) Update(ctx context.Context, task *taskdomain.Task) (*taskdomain.Task, error) {
-	const query = `
-		UPDATE tasks
-		SET title = $1,
-			description = $2,
-			status = $3,
-			updated_at = $4
-		WHERE id = $5
-		RETURNING id, title, description, status, created_at, updated_at
-	`
+	var ruleJSON *string
+	if task.RecurrenceRule != nil {
+		jsonStr, err := task.RecurrenceRule.ToJSON()
+		if err != nil {
+			return nil, err
+		}
+		ruleJSON = &jsonStr
+	}
 
-	row := r.pool.QueryRow(ctx, query, task.Title, task.Description, task.Status, task.UpdatedAt, task.ID)
+	const query = `
+        UPDATE tasks
+        SET title = $1,
+            description = $2,
+            status = $3,
+            updated_at = $4,
+            recurrence_type = $5,
+            recurrence_rule = $6
+        WHERE id = $7
+        RETURNING id, title, description, status, created_at, updated_at, recurrence_type, recurrence_rule
+    `
+
+	row := r.pool.QueryRow(ctx, query,
+		task.Title,
+		task.Description,
+		task.Status,
+		task.UpdatedAt,
+		task.RecurrenceType,
+		ruleJSON,
+		task.ID,
+	)
+
 	updated, err := scanTask(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, taskdomain.ErrNotFound
 		}
-
 		return nil, err
 	}
 
@@ -95,10 +132,10 @@ func (r *Repository) Delete(ctx context.Context, id int64) error {
 
 func (r *Repository) List(ctx context.Context) ([]taskdomain.Task, error) {
 	const query = `
-		SELECT id, title, description, status, created_at, updated_at
-		FROM tasks
-		ORDER BY id DESC
-	`
+        SELECT id, title, description, status, created_at, updated_at, recurrence_type, recurrence_rule
+        FROM tasks
+        ORDER BY id DESC
+    `
 
 	rows, err := r.pool.Query(ctx, query)
 	if err != nil {
@@ -112,7 +149,6 @@ func (r *Repository) List(ctx context.Context) ([]taskdomain.Task, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		tasks = append(tasks, *task)
 	}
 
@@ -123,14 +159,44 @@ func (r *Repository) List(ctx context.Context) ([]taskdomain.Task, error) {
 	return tasks, nil
 }
 
+func (r *Repository) GetTasksForDate(ctx context.Context, date time.Time) ([]taskdomain.Task, error) {
+	const query = `
+        SELECT id, title, description, status, created_at, updated_at, recurrence_type, recurrence_rule
+        FROM tasks
+        WHERE status != 'done'
+        ORDER BY created_at DESC
+    `
+
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tasks := make([]taskdomain.Task, 0)
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			continue
+		}
+
+		if task.MatchesDate(date) {
+			tasks = append(tasks, *task)
+		}
+	}
+
+	return tasks, rows.Err()
+}
+
 type taskScanner interface {
 	Scan(dest ...any) error
 }
 
 func scanTask(scanner taskScanner) (*taskdomain.Task, error) {
 	var (
-		task   taskdomain.Task
-		status string
+		task     taskdomain.Task
+		status   string
+		ruleJSON *string
 	)
 
 	if err := scanner.Scan(
@@ -140,11 +206,21 @@ func scanTask(scanner taskScanner) (*taskdomain.Task, error) {
 		&status,
 		&task.CreatedAt,
 		&task.UpdatedAt,
+		&task.RecurrenceType,
+		&ruleJSON,
 	); err != nil {
 		return nil, err
 	}
 
 	task.Status = taskdomain.Status(status)
+
+	if ruleJSON != nil && *ruleJSON != "" {
+		rule, err := taskdomain.RuleFromJSON(*ruleJSON)
+		if err != nil {
+			return nil, err
+		}
+		task.RecurrenceRule = rule
+	}
 
 	return &task, nil
 }
